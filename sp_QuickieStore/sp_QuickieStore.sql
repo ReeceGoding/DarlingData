@@ -93,6 +93,10 @@ ALTER PROCEDURE
     @workdays bit = 0, /*Use this to filter out weekends and after-hours queries*/
     @work_start time(0) = '9am', /*Use this to set a specific start of your work days*/
     @work_end time(0) = '5pm', /*Use this to set a specific end of your work days*/
+    @regression_baseline_start_date datetimeoffset(7) = NULL, /*the begin date of the baseline that you are checking for regressions against (if any), will be converted to UTC internally*/
+    @regression_baseline_end_date datetimeoffset(7) = NULL, /*the end date of the baseline that you are checking for regressions against (if any), will be converted to UTC internally*/
+    @regression_comparator varchar(20) = NULL, /*how you want the @sort_order's metric to be compared against the current data (relative difference or absolute difference) if you are checking for regressions.*/
+    @regression_direction varchar(20) = NULL, /*what you are looking for in queries when comparing against the regression baseline (magnitude, improved, regressed)?*/
     @help bit = 0, /*return available parameter details, etc.*/
     @debug bit = 0, /*prints dynamic sql, statement length, parameter and variable values, and raw temp table contents*/
     @troubleshoot_performance bit = 0, /*set statistics xml on for queries against views*/
@@ -133,8 +137,8 @@ END;
 These are for your outputs.
 */
 SELECT
-    @version = '4.7',
-    @version_date = '20240701';
+    @version = '4.9',
+    @version_date = '20240901';
 
 /*
 Helpful section! For help.
@@ -202,6 +206,10 @@ BEGIN
                 WHEN N'@workdays' THEN 'use this to filter out weekends and after-hours queries'
                 WHEN N'@work_start' THEN 'use this to set a specific start of your work days'
                 WHEN N'@work_end' THEN 'use this to set a specific end of your work days'
+                WHEN N'@regression_baseline_start_date' THEN 'the begin date of the baseline that you are checking for regressions against (if any), will be converted to UTC internally'
+                WHEN N'@regression_baseline_end_date' THEN 'the end date of the baseline that you are checking for regressions against (if any), will be converted to UTC internally'
+                WHEN N'@regression_comparator' THEN 'how you want the @sort_order''s metric to be compared against the current data (relative difference or absolute difference) if you are checking for regressions.'
+                WHEN N'@regression_direction' THEN 'what you are looking for in queries when comparing against the regression baseline (magnitude, improved, regressed)?'
                 WHEN N'@help' THEN 'how you got here'
                 WHEN N'@debug' THEN 'prints dynamic sql, statement length, parameter and variable values, and raw temp table contents'
                 WHEN N'@troubleshoot_performance' THEN 'set statistics xml on for queries against views'
@@ -250,6 +258,10 @@ BEGIN
                 WHEN N'@workdays' THEN '0 or 1'
                 WHEN N'@work_start' THEN 'a time like 8am, 9am or something'
                 WHEN N'@work_end' THEN 'a time like 5pm, 6pm or something'
+                WHEN N'@regression_baseline_start_date' THEN 'January 1, 1753, through December 31, 9999'
+                WHEN N'@regression_baseline_end_date' THEN 'January 1, 1753, through December 31, 9999'
+                WHEN N'@regression_comparator' THEN 'relative, absolute'
+                WHEN N'@regression_direction' THEN 'regressed, worse, improved, better, magnitude, absolute, whatever'
                 WHEN N'@help' THEN '0 or 1'
                 WHEN N'@debug' THEN '0 or 1'
                 WHEN N'@troubleshoot_performance' THEN '0 or 1'
@@ -298,6 +310,10 @@ BEGIN
                 WHEN N'@workdays' THEN '0'
                 WHEN N'@work_start' THEN '9am'
                 WHEN N'@work_end' THEN '5pm'
+                WHEN N'@regression_baseline_start_date' THEN 'NULL'
+                WHEN N'@regression_baseline_end_date' THEN 'NULL; One week after @regression_baseline_start_date if that is specified'
+                WHEN N'@regression_comparator' THEN 'NULL; absolute if @regression_baseline_start_date is specified'
+                WHEN N'@regression_direction' THEN 'NULL; regressed if @regression_baseline_start_date is specified'
                 WHEN N'@debug' THEN '0'
                 WHEN N'@help' THEN '0'
                 WHEN N'@troubleshoot_performance' THEN '0'
@@ -525,7 +541,7 @@ CREATE TABLE
     database_id int NOT NULL,
     plan_id bigint NOT NULL,
     query_hash binary(8) NOT NULL,
-    plan_hash_count_for_query_hash INT NOT NULL,
+    plan_hash_count_for_query_hash int NOT NULL,
     PRIMARY KEY (database_id, plan_id, query_hash)
 );
 
@@ -540,6 +556,67 @@ CREATE TABLE
     plan_id bigint NOT NULL,
     total_query_wait_time_ms bigint NOT NULL,
     PRIMARY KEY (database_id, plan_id)
+);
+
+/*
+Clone the relevant sort-helping tables because we need
+both an original and a clone for regression mode.
+
+This is ugly, but every other approach either required
+making changes to @parameters or made the primary keys
+include a silly extra column.
+*/
+CREATE TABLE
+    #regression_baseline_plan_ids_with_total_waits
+(
+    database_id int NOT NULL,
+    plan_id bigint NOT NULL,
+    total_query_wait_time_ms bigint NOT NULL,
+    PRIMARY KEY (database_id, plan_id)
+);
+
+/*
+Used in regression mode to hold the
+statistics for each query hash in our
+baseline time period.
+*/
+CREATE TABLE
+    #regression_baseline_runtime_stats
+(
+    query_hash binary(8) NOT NULL PRIMARY KEY,
+    regression_metric_average float NOT NULL
+);
+
+/*
+Used in regression mode to hold the
+statistics for each query hash in our
+normal time period.
+*/
+CREATE TABLE
+    #regression_current_runtime_stats
+(
+    query_hash binary(8) NOT NULL PRIMARY KEY,
+    current_metric_average float NOT NULL
+);
+
+/*
+Used in regression mode to hold the
+results of comparing our two time
+periods.
+
+This is also used just like a
+sort-helping table. For example,
+it is used to bolt a column
+on to our final output.
+*/
+CREATE TABLE
+    #regression_changes
+(
+    database_id int NOT NULL,
+    plan_id bigint NOT NULL,
+    query_hash binary(8) NOT NULL,
+    change_since_regression_time_period float,
+    PRIMARY KEY (database_id, plan_id, query_hash)
 );
 
 /*
@@ -1010,6 +1087,7 @@ CREATE TABLE
     max_tempdb_space_used_mb bigint NULL,
     total_tempdb_space_used_mb AS
         (avg_tempdb_space_used_mb * count_executions),
+    from_regression_baseline varchar(3) NULL,
     context_settings nvarchar(256) NULL
 );
 
@@ -1214,11 +1292,15 @@ DECLARE
     @start_date_original datetimeoffset(7),
     @end_date_original datetimeoffset(7),
     @utc_minutes_difference bigint,
-    @utc_minutes_original bigint,
+    @utc_offset_string nvarchar(6),
     @df integer,
     @work_start_utc time(0),
     @work_end_utc time(0),
-    @sort_order_is_a_wait bit;
+    @sort_order_is_a_wait bit,
+    @regression_baseline_start_date_original datetimeoffset(7),
+    @regression_baseline_end_date_original datetimeoffset(7),
+    @regression_mode bit,
+    @regression_where_clause nvarchar(max);
 
 /*
 In cases where we are escaping @query_text_search and
@@ -1265,6 +1347,146 @@ SELECT
         ISNULL
         (
             @end_date,
+            DATEADD
+            (
+                DAY,
+                1,
+                DATEADD
+                (
+                    MINUTE,
+                    0,
+                    DATEDIFF
+                    (
+                        DAY,
+                        '19000101',
+                        SYSUTCDATETIME()
+                    )
+                )
+            )
+        );
+
+/*
+Set @regression_mode if the given arguments indicate that
+we are checking for regressed queries.
+*/
+IF
+(
+@regression_baseline_start_date IS NOT NULL
+)
+BEGIN
+    SELECT
+        @regression_mode = 1;
+END;
+
+/*
+Error out if the @regression parameters do not make sense.
+*/
+IF
+(
+@regression_baseline_start_date IS NULL
+AND (@regression_baseline_end_date IS NOT NULL OR @regression_comparator IS NOT NULL OR @regression_direction IS NOT NULL)
+)
+BEGIN
+    RAISERROR('@regression_baseline_start_date is mandatory if you have specified any other @regression_ parameter.', 11, 1) WITH NOWAIT;
+END;
+
+/*
+Validate @regression_comparator.
+*/
+IF
+(
+@regression_comparator IS NOT NULL
+AND @regression_comparator NOT IN ('relative', 'absolute')
+)
+BEGIN
+   RAISERROR('The regression_comparator (%s) you chose is so out of this world that I''m using ''relative'' instead', 10, 1, @regression_comparator) WITH NOWAIT;
+
+   SELECT
+       @regression_comparator = 'relative';
+END;
+
+/*
+Validate @regression_direction.
+*/
+IF
+(
+@regression_direction IS NOT NULL
+AND @regression_direction NOT IN ('regressed', 'worse', 'improved', 'better', 'magnitude', 'absolute')
+)
+BEGIN
+   RAISERROR('The regression_direction (%s) you chose is so out of this world that I''m using ''absolute'' instead', 10, 1, @regression_direction) WITH NOWAIT;
+
+   SELECT
+       @regression_direction = 'absolute';
+END;
+
+/*
+Error out if we're trying to do regression mode with 'recent'
+as our @sort_order. How could that ever make sense?
+*/
+IF
+(
+@regression_mode = 1
+AND @sort_order = 'recent'
+)
+BEGIN
+    RAISERROR('Your @sort_order is ''recent'', but you are trying to compare metrics for two time periods. If you can imagine a useful way to do that, then make a feature request. Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
+END;
+
+/*
+Error out if we're trying to do regression mode with 'plan count by hashes'
+as our @sort_order. How could that ever make sense?
+*/
+IF
+(
+@regression_mode = 1
+AND @sort_order = 'plan count by hashes'
+)
+BEGIN
+    RAISERROR('Your @sort_order is ''plan count by hashes'', but you are trying to compare metrics for two time periods. This is probably not useful, since our method of comparing two time period relies on only checking query hashes that are in both time periods. If you can imagine a useful way to do that, then make a feature request. Otherwise, either stop specifying any @regression_ parameters or specify a different @sort_order.', 11, 1) WITH NOWAIT;
+END;
+
+
+/*
+Error out if @regression_comparator tells us to use division,
+but @regression_direction tells us to take the modulus.
+It doesn't make sense to specifically ask us to remove the sign
+of something that doesn't care about it.
+*/
+IF
+(
+@regression_comparator = 'relative'
+AND @regression_direction IN ('absolute', 'magnitude')
+)
+BEGIN
+    RAISERROR('Your @regression_comparator is ''relative'', but you have asked for an ''absolute'' or ''magnitude'' @regression_direction. This is probably a mistake. Your @regression_direction tells us to take the absolute value of our result of comparing the metrics in the current time period to the baseline time period, but your @regression_comparator is telling us to use division to compare the two time periods. This is unlikely to produce useful results. If you can imagine a useful way to do that, then make a feature request. Otherwise, either change @regression_direction to another value (e.g. ''better'' or ''worse'') or change @regression_comparator to ''absolute''.', 11, 1) WITH NOWAIT;
+END;
+
+
+/*
+Same trick as above with @start_date.
+*/
+SELECT
+    @regression_baseline_start_date_original =
+        ISNULL
+        (
+            @regression_baseline_start_date,
+            DATEADD
+            (
+                DAY,
+                -7,
+                DATEDIFF
+                (
+                    DAY,
+                    '19000101',
+                    SYSUTCDATETIME()
+                )
+            )
+        ),
+    @regression_baseline_end_date_original =
+        ISNULL
+        (
+            @regression_baseline_end_date,
             DATEADD
             (
                 DAY,
@@ -1467,7 +1689,9 @@ SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;',
           @database_id int,
           @queries_top bigint,
           @work_start_utc time(0),
-          @work_end_utc time(0)',
+          @work_end_utc time(0),
+          @regression_baseline_start_date datetimeoffset(7),
+          @regression_baseline_end_date datetimeoffset(7)',
     @plans_top =
         9223372036854775807,
     @queries_top =
@@ -1633,13 +1857,18 @@ SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;',
             SYSDATETIME(),
             SYSUTCDATETIME()
         ),
-    @utc_minutes_original =
-        DATEDIFF
-        (
-            MINUTE,
-            SYSUTCDATETIME(),
-            SYSDATETIME()
-        ),
+    /*
+        There is no direct way to get the user's timezone in a
+        format compatible with sys.time_zone_info.
+
+        We also cannot directly get their UTC offset,
+        so we need this hack to get it instead.
+
+        This is to make our datetimeoffsets have the
+        correct offset in cases where the user didn't
+        give us their timezone.
+    */
+    @utc_offset_string = RIGHT(SYSDATETIMEOFFSET(), 6),
     @df = @@DATEFIRST,
     @work_start_utc = @work_start,
     @work_end_utc = @work_end;
@@ -1784,6 +2013,52 @@ BEGIN
                 1,
                 @start_date_original
             );
+END;
+
+/*
+As above, but for @regression_baseline_start_date and @regression_baseline_end_date.
+We set the other @regression_ variables while we're at it.
+*/
+IF @regression_mode = 1
+BEGIN
+
+/*
+The trick here is that we know that @regression_baseline_start_date
+is not NULL by now.
+*/
+
+SELECT
+    @regression_baseline_start_date =
+            DATEADD
+            (
+                MINUTE,
+                @utc_minutes_difference,
+                @regression_baseline_start_date_original
+            ),
+    @regression_baseline_end_date =
+        CASE
+            WHEN @regression_baseline_end_date IS NULL
+                 OR @regression_baseline_start_date >= @regression_baseline_end_date
+            THEN
+                DATEADD
+                (
+                    DAY,
+                    7,
+                    @regression_baseline_start_date
+                )
+            WHEN @regression_baseline_end_date IS NOT NULL
+            THEN
+                DATEADD
+                (
+                    MINUTE,
+                    @utc_minutes_difference,
+                    @regression_baseline_end_date_original
+                )
+        END,
+    @regression_comparator =
+        ISNULL(@regression_comparator, 'absolute'),
+    @regression_direction =
+        ISNULL(@regression_direction, 'regressed');
 END;
 
 /*
@@ -4544,16 +4819,72 @@ SELECT
         );
 
 /*
+Regression mode differs significantly from our defaults.
+In this mode, we measure every query hash in the time period
+specified by @regression_baseline_start_date.
+Our measurements are taken based on the metric given
+by @sort_order.
+For all of the hashes we have taken measurements for, we
+make the same measurement for the time period specified
+by @start_date.
+We then compare each hashes' measurement across the two
+time periods, by the means specified by
+@regression_comparator and take the @TOP results ordered by
+@regression_direction.
+We then get every plan_id in both time periods for those
+query hashes and carry on as normal.
+
+This gives us three immediate concerns. We:
+   1) Need to adjust our @where_clause to refer to the
+      baseline time period.
+   2) Need all of the queries from the baseline time
+      period (rather than just the @TOP whatever).
+   3) Are interested in the query hashes rather than
+      just plan_ids.
+
+We address part of the first concern immediately.
+Later, we will do some wicked and foul things to
+modify our dynamic SQL's usages of @where_clause
+to use @regression_where_clause.
+*/
+IF @regression_mode = 1
+BEGIN
+
+SELECT
+    @regression_where_clause =
+        REPLACE
+        (
+            REPLACE
+            (
+                @where_clause,
+                '@start_date',
+                '@regression_baseline_start_date'
+            ),
+           '@end_date',
+           '@regression_baseline_end_date'
+        );
+END;
+
+/*
 Populate sort-helping tables, if needed.
 
 In theory, these exist just to put in scope
 columns that wouldn't normally be in scope.
-However, they're also  quite helpful for the next
+However, they're also quite helpful for the next
 temp table, #distinct_plans.
 
 Note that this block must come after #maintenance_plans
 because that edits @where_clause and we want to use
 that here.
+
+Regression mode complicates this process considerably.
+It forces us to run queries twice with different
+dates. We also have to adjust @top.
+
+Luckily, the 'plan count by hashes' sort
+order is not supported in regression mode.
+Earlier on, we throw an error if somebody
+tries (it just doesn't make sense).
 */
 IF @sort_order = 'plan count by hashes'
 BEGIN
@@ -4630,7 +4961,7 @@ BEGIN
         PRINT LEN(@sql);
         PRINT @sql;
     END;
-    
+
     INSERT
         #plan_ids_with_query_hashes WITH(TABLOCK)
     (
@@ -4651,7 +4982,9 @@ BEGIN
         @database_id,
         @queries_top,
         @work_start_utc,
-        @work_end_utc;
+        @work_end_utc,
+        @regression_baseline_start_date,
+        @regression_baseline_end_date;
     
     IF @troubleshoot_performance = 1
     BEGIN
@@ -4668,7 +5001,7 @@ BEGIN
             @current_table nvarchar(100)',
             @sql,
             @current_table;
-    END; 
+    END;
 END;
 IF @sort_order = 'total waits'
 BEGIN
@@ -4704,32 +5037,145 @@ BEGIN
         SUM(qsws.total_query_wait_time_ms) DESC
     OPTION(RECOMPILE, OPTIMIZE FOR (@top = 9223372036854775807));' + @nc10;
 
-    IF @debug = 1
+    IF @regression_mode = 1
     BEGIN
-        PRINT LEN(@sql);
-        PRINT @sql;
+
+        SELECT
+           @sql = REPLACE
+                   (
+                       @sql,
+                       'TOP (@top)',
+                       ''
+                   );
+
+        IF @debug = 1
+        BEGIN
+            PRINT LEN(@sql);
+            PRINT @sql;
+        END;
+
+        INSERT
+            #plan_ids_with_total_waits WITH(TABLOCK)
+        (
+            database_id,
+            plan_id,
+            total_query_wait_time_ms
+        )
+        EXEC sys.sp_executesql
+            @sql,
+            @parameters,
+            @top,
+            @start_date,
+            @end_date,
+            @execution_count,
+            @duration_ms,
+            @execution_type_desc,
+            @database_id,
+            @queries_top,
+            @work_start_utc,
+            @work_end_utc,
+            @regression_baseline_start_date,
+            @regression_baseline_end_date;
+
+        IF @troubleshoot_performance = 1
+        BEGIN
+            SET STATISTICS XML OFF;
+
+            EXEC sys.sp_executesql
+                @troubleshoot_update,
+              N'@current_table nvarchar(100)',
+                @current_table;
+
+            EXEC sys.sp_executesql
+                @troubleshoot_info,
+              N'@sql nvarchar(max),
+                @current_table nvarchar(100)',
+                @sql,
+                @current_table;
+        END;
+
+        SELECT
+            @current_table = 'inserting #regression_baseline_plan_ids_with_total_waits',
+            @sql = REPLACE
+                    (
+                        @sql,
+                        '@where_clause',
+                        '@regression_where_clause'
+                    );
+
+        IF @troubleshoot_performance = 1
+        BEGIN
+            EXEC sys.sp_executesql
+                @troubleshoot_insert,
+              N'@current_table nvarchar(100)',
+                @current_table;
+
+            SET STATISTICS XML ON;
+        END;
+
+        IF @debug = 1
+        BEGIN
+            PRINT LEN(@sql);
+            PRINT @sql;
+        END; 
+
+        INSERT
+            #regression_baseline_plan_ids_with_total_waits WITH(TABLOCK)
+        (
+            database_id,
+            plan_id,
+            total_query_wait_time_ms
+        )
+        EXEC sys.sp_executesql
+            @sql,
+            @parameters,
+            @top,
+            @start_date,
+            @end_date,
+            @execution_count,
+            @duration_ms,
+            @execution_type_desc,
+            @database_id,
+            @queries_top,
+            @work_start_utc,
+            @work_end_utc,
+            @regression_baseline_start_date,
+            @regression_baseline_end_date;
+            
+    END
+    ELSE
+    BEGIN
+
+        IF @debug = 1
+        BEGIN
+            PRINT LEN(@sql);
+            PRINT @sql;
+        END;
+
+        INSERT
+            #plan_ids_with_total_waits WITH(TABLOCK)
+        (
+            database_id,
+            plan_id,
+            total_query_wait_time_ms
+        )
+        EXEC sys.sp_executesql
+            @sql,
+            @parameters,
+            @top,
+            @start_date,
+            @end_date,
+            @execution_count,
+            @duration_ms,
+            @execution_type_desc,
+            @database_id,
+            @queries_top,
+            @work_start_utc,
+            @work_end_utc,
+            @regression_baseline_start_date,
+            @regression_baseline_end_date;
+
     END;
-    
-    INSERT
-        #plan_ids_with_total_waits WITH(TABLOCK)
-    (
-        database_id,
-        plan_id,
-        total_query_wait_time_ms
-    )
-    EXEC sys.sp_executesql
-        @sql,
-        @parameters,
-        @top,
-        @start_date,
-        @end_date,
-        @execution_count,
-        @duration_ms,
-        @execution_type_desc,
-        @database_id,
-        @queries_top,
-        @work_start_utc,
-        @work_end_utc;
     
     IF @troubleshoot_performance = 1
     BEGIN
@@ -4796,6 +5242,8 @@ BEGIN
          WHEN 'parallelism waits' THEN N'16'
          WHEN 'memory waits' THEN N'17'
     END
+      + N'
+      '
       + @where_clause
       + N'
     GROUP
@@ -4803,34 +5251,148 @@ BEGIN
     ORDER BY
         MAX(qsws.total_query_wait_time_ms) DESC
     OPTION(RECOMPILE, OPTIMIZE FOR (@top = 9223372036854775807));' + @nc10;
-
-    IF @debug = 1
+    
+    IF @regression_mode = 1
     BEGIN
-        PRINT LEN(@sql);
-        PRINT @sql;
+
+        /* Very stupid way to stop us repeating the above code. */
+        SELECT
+           @sql = REPLACE
+                   (
+                       @sql,
+                       'TOP (@top)',
+                       'TOP (2147483647 + (0 * @top))'
+                   );
+
+        IF @debug = 1
+        BEGIN
+            PRINT LEN(@sql);
+            PRINT @sql;
+        END;
+
+        INSERT
+            #plan_ids_with_total_waits WITH(TABLOCK)
+        (
+            database_id,
+            plan_id,
+            total_query_wait_time_ms
+        )
+        EXEC sys.sp_executesql
+            @sql,
+            @parameters,
+            @top,
+            @start_date,
+            @end_date,
+            @execution_count,
+            @duration_ms,
+            @execution_type_desc,
+            @database_id,
+            @queries_top,
+            @work_start_utc,
+            @work_end_utc,
+            @regression_baseline_start_date,
+            @regression_baseline_end_date;
+
+        IF @troubleshoot_performance = 1
+        BEGIN
+            SET STATISTICS XML OFF;
+
+            EXEC sys.sp_executesql
+                @troubleshoot_update,
+              N'@current_table nvarchar(100)',
+                @current_table;
+
+            EXEC sys.sp_executesql
+                @troubleshoot_info,
+              N'@sql nvarchar(max),
+                @current_table nvarchar(100)',
+                @sql,
+                @current_table;
+        END;
+
+        SELECT
+            @current_table = 'inserting #regression_baseline_plan_ids_with_total_waits',
+            @sql = REPLACE
+                    (
+                        @sql,
+                        '@where_clause',
+                        '@regression_where_clause'
+                    );
+
+        IF @troubleshoot_performance = 1
+        BEGIN
+            EXEC sys.sp_executesql
+                @troubleshoot_insert,
+              N'@current_table nvarchar(100)',
+                @current_table;
+
+            SET STATISTICS XML ON;
+        END;
+
+        IF @debug = 1
+        BEGIN
+            PRINT LEN(@sql);
+            PRINT @sql;
+        END; 
+
+        INSERT
+            #regression_baseline_plan_ids_with_total_waits WITH(TABLOCK)
+        (
+            database_id,
+            plan_id,
+            total_query_wait_time_ms
+        )
+        EXEC sys.sp_executesql
+            @sql,
+            @parameters,
+            @top,
+            @start_date,
+            @end_date,
+            @execution_count,
+            @duration_ms,
+            @execution_type_desc,
+            @database_id,
+            @queries_top,
+            @work_start_utc,
+            @work_end_utc,
+            @regression_baseline_start_date,
+            @regression_baseline_end_date;
+            
+    END
+    ELSE
+    BEGIN
+    
+        IF @debug = 1
+        BEGIN
+            PRINT LEN(@sql);
+            PRINT @sql;
+        END;
+        
+        INSERT
+            #plan_ids_with_total_waits WITH(TABLOCK)
+        (
+            database_id,
+            plan_id,
+            total_query_wait_time_ms
+        )
+        EXEC sys.sp_executesql
+            @sql,
+            @parameters,
+            @top,
+            @start_date,
+            @end_date,
+            @execution_count,
+            @duration_ms,
+            @execution_type_desc,
+            @database_id,
+            @queries_top,
+            @work_start_utc,
+            @work_end_utc,
+            @regression_baseline_start_date,
+            @regression_baseline_end_date;
+
     END;
-    
-    INSERT
-        #plan_ids_with_total_waits WITH(TABLOCK)
-    (
-        database_id,
-        plan_id,
-        total_query_wait_time_ms
-    )
-    EXEC sys.sp_executesql
-        @sql,
-        @parameters,
-        @top,
-        @start_date,
-        @end_date,
-        @execution_count,
-        @duration_ms,
-        @execution_type_desc,
-        @database_id,
-        @queries_top,
-        @work_start_utc,
-        @work_end_utc;
-    
+
     IF @troubleshoot_performance = 1
     BEGIN
         SET STATISTICS XML OFF;
@@ -4846,9 +5408,366 @@ BEGIN
             @current_table nvarchar(100)',
             @sql,
             @current_table;
-    END; 
+    END;
 END;
 /*End populating sort-helping tables*/
+
+/*
+This is where the bulk of the regression mode
+work is done. We grab the metrics for both time
+periods for each query hash, compare them,
+and get the @TOP.
+*/
+IF @regression_mode = 1
+BEGIN
+    /*
+    We begin by getting the metrics per query hash
+    in the time period.
+    */
+    SELECT
+        @current_table = 'inserting #regression_baseline_runtime_stats',
+        @sql = @isolation_level;
+    
+    IF @troubleshoot_performance = 1
+    BEGIN
+        EXEC sys.sp_executesql
+            @troubleshoot_insert,
+          N'@current_table nvarchar(100)',
+            @current_table;
+    
+        SET STATISTICS XML ON;
+    END;
+
+    SELECT
+        @sql += N'
+    SELECT
+        qsq.query_hash,
+        /* All of these but count_executions are already floats. */
+        CONVERT(FLOAT, AVG( ' +
+        CASE @sort_order
+             WHEN 'cpu' THEN N'qsrs.avg_cpu_time'
+             WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads'
+             WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads'
+             WHEN 'writes' THEN N'qsrs.avg_logical_io_writes'
+             WHEN 'duration' THEN N'qsrs.avg_duration'
+             WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory'
+             WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used' ELSE N'qsrs.avg_cpu_time' END
+             WHEN 'executions' THEN N'qsrs.count_executions'
+             ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+        END
+        + N' )) AS regression_metric_average
+    FROM ' + @database_name_quoted + N'.sys.query_store_query AS qsq
+    JOIN ' + @database_name_quoted + N'.sys.query_store_plan AS qsp
+       ON qsq.query_id = qsp.query_id
+    JOIN ' + @database_name_quoted + N'.sys.query_store_runtime_stats AS qsrs
+      ON qsp.plan_id = qsrs.plan_id
+    LEFT JOIN #plan_ids_with_total_waits AS waits
+      ON qsp.plan_id = waits.plan_id
+    WHERE 1 = 1
+    ' + @regression_where_clause
+      + N'
+    GROUP
+        BY qsq.query_hash
+    OPTION(RECOMPILE);' + @nc10;
+
+    IF @debug = 1
+    BEGIN
+        PRINT LEN(@sql);
+        PRINT @sql;
+    END;
+
+    INSERT
+        #regression_baseline_runtime_stats WITH(TABLOCK)
+    (
+        query_hash,
+        regression_metric_average
+    )
+    EXEC sys.sp_executesql
+        @sql,
+        @parameters,
+        @top,
+        @start_date,
+        @end_date,
+        @execution_count,
+        @duration_ms,
+        @execution_type_desc,
+        @database_id,
+        @queries_top,
+        @work_start_utc,
+        @work_end_utc,
+        @regression_baseline_start_date,
+        @regression_baseline_end_date;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        SET STATISTICS XML OFF;
+    
+        EXEC sys.sp_executesql
+            @troubleshoot_update,
+          N'@current_table nvarchar(100)',
+            @current_table;
+    
+        EXEC sys.sp_executesql
+            @troubleshoot_info,
+          N'@sql nvarchar(max),
+            @current_table nvarchar(100)',
+            @sql,
+            @current_table;
+    END;
+
+    /*
+        We now take the same measurement
+        for all of the same query hashes,
+        but in the @where_clause time
+        period.
+    */
+    SELECT
+        @current_table = 'inserting #regression_current_runtime_stats',
+        @sql = @isolation_level;
+    
+    IF @troubleshoot_performance = 1
+    BEGIN
+        EXEC sys.sp_executesql
+            @troubleshoot_insert,
+          N'@current_table nvarchar(100)',
+            @current_table;
+    
+        SET STATISTICS XML ON;
+    END;
+
+    SELECT
+        @sql += N'
+    SELECT
+        qsq.query_hash,
+        /* All of these but count_executions are already floats. */
+        CONVERT(FLOAT, AVG( ' +
+        CASE @sort_order
+             WHEN 'cpu' THEN N'qsrs.avg_cpu_time'
+             WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads'
+             WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads'
+             WHEN 'writes' THEN N'qsrs.avg_logical_io_writes'
+             WHEN 'duration' THEN N'qsrs.avg_duration'
+             WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory'
+             WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used' ELSE N'qsrs.avg_cpu_time' END
+             WHEN 'executions' THEN N'qsrs.count_executions'
+             ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+        END
+        + N' )) AS current_metric_average
+    FROM ' + @database_name_quoted + N'.sys.query_store_query AS qsq
+    JOIN ' + @database_name_quoted + N'.sys.query_store_plan AS qsp
+       ON qsq.query_id = qsp.query_id
+    JOIN ' + @database_name_quoted + N'.sys.query_store_runtime_stats AS qsrs
+      ON qsp.plan_id = qsrs.plan_id
+    LEFT JOIN #plan_ids_with_total_waits AS waits
+      ON qsp.plan_id = waits.plan_id
+    WHERE 1 = 1
+    AND qsq.query_hash IN (SELECT base.query_hash FROM #regression_baseline_runtime_stats AS base)
+    ' + @where_clause
+      + N'
+    GROUP
+        BY qsq.query_hash
+    OPTION(RECOMPILE);' + @nc10;
+
+    IF @debug = 1
+    BEGIN
+        PRINT LEN(@sql);
+        PRINT @sql;
+    END;
+
+    INSERT
+        #regression_current_runtime_stats WITH(TABLOCK)
+    (
+        query_hash,
+        current_metric_average
+    )
+    EXEC sys.sp_executesql
+        @sql,
+        @parameters,
+        @top,
+        @start_date,
+        @end_date,
+        @execution_count,
+        @duration_ms,
+        @execution_type_desc,
+        @database_id,
+        @queries_top,
+        @work_start_utc,
+        @work_end_utc,
+        @regression_baseline_start_date,
+        @regression_baseline_end_date;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        SET STATISTICS XML OFF;
+    
+        EXEC sys.sp_executesql
+            @troubleshoot_update,
+          N'@current_table nvarchar(100)',
+            @current_table;
+    
+        EXEC sys.sp_executesql
+            @troubleshoot_info,
+          N'@sql nvarchar(max),
+            @current_table nvarchar(100)',
+            @sql,
+            @current_table;
+    END;
+
+    SELECT
+        @current_table = 'inserting #regression_changes',
+        @sql = @isolation_level;
+    
+    IF @troubleshoot_performance = 1
+    BEGIN
+        EXEC sys.sp_executesql
+            @troubleshoot_insert,
+          N'@current_table nvarchar(100)',
+            @current_table;
+    
+        SET STATISTICS XML ON;
+    END;
+
+    /*
+    Now that we have the data from
+    both time periods, we must
+    compare them as @regression_comparator
+    demands and order them as
+    @regression_direction demands.
+
+    However, we care about query_hashes
+    here despite everything after this
+    wanting plan_ids. This means we
+    must repeat some of the tricks
+    we used for #plan_ids_with_query_hashes.
+    */
+    SELECT      
+        @sql += N'
+    SELECT
+        @database_id,
+        plans_for_hashes.plan_id,
+        hashes_with_changes.query_hash,
+        hashes_with_changes.change_since_regression_time_period
+    FROM
+    (
+        SELECT TOP (@TOP)
+            compared_stats.query_hash,
+            compared_stats.change_since_regression_time_period
+        FROM
+        (
+            SELECT
+                current_stats.query_hash,
+                '
+                + CASE @regression_comparator
+                      WHEN 'relative' THEN N'((current_stats.current_metric_average / NUFFIF(baseline.regression_metric_average, 0)) - 1)'
+                      WHEN 'absolute' THEN N'(current_stats.current_metric_average - baseline.regression_metric_average)'
+                  END
+                + N' AS change_since_regression_time_period
+            FROM #regression_current_runtime_stats AS current_stats
+            JOIN #regression_baseline_runtime_stats AS baseline
+              ON current_stats.query_hash = baseline.query_hash
+        ) AS compared_stats
+        ORDER BY
+            '
+            /*
+            Current metrics that are better than that of the baseline period,
+            will give change_since_regression_time_period values that
+            are smaller than metrics that are worse.
+            This is true regardless of @regression_comparator.
+            To make @regression_direction behave as intended, we
+            need to account for this. We could use dynamic SQL,
+            but mathematics has given us better tools.
+            */
+            + CASE @regression_direction
+               WHEN 'regressed' THEN N'change_since_regression_time_period * -1'
+               WHEN 'worse' THEN N'change_since_regression_time_period * -1 '
+               WHEN 'improved' THEN N'change_since_regression_time_period'
+               WHEN 'better' THEN N'change_since_regression_time_period'
+               /*
+               The following two branches cannot be hit if
+               @regression_comparator is absolute.
+               We have made errors be thrown if somebody tries
+               to mix the two.
+               If you can figure out a way to make the two make
+               sense together, then feel free to add it in.
+               */
+               WHEN 'magnitude' THEN N'ABS(change_since_regression_time_period)'
+               WHEN 'absolute' THEN N'ABS(change_since_regression_time_period)'
+            END
+            + N' DESC
+    ) AS hashes_with_changes
+    JOIN
+    (
+       SELECT DISTINCT
+           qsq.query_hash,
+           qsp.plan_id
+       FROM ' + @database_name_quoted + N'.sys.query_store_query AS qsq
+       JOIN ' + @database_name_quoted + N'.sys.query_store_plan AS qsp
+          ON qsq.query_id = qsp.query_id
+       JOIN ' + @database_name_quoted + N'.sys.query_store_runtime_stats AS qsrs
+         ON qsp.plan_id = qsrs.plan_id
+        WHERE
+        ( 1 = 1
+        '
+        /* We want each time period's plan_ids for these query hashes. */
+         + @regression_where_clause
+         + N'
+         )
+         OR
+         ( 1 = 1 '
+         + @where_clause
+         + N' ) 
+    ) AS plans_for_hashes
+    ON hashes_with_changes.query_hash = plans_for_hashes.query_hash
+    OPTION(RECOMPILE, OPTIMIZE FOR (@top = 9223372036854775807));' + @nc10;
+
+    IF @debug = 1
+    BEGIN
+        PRINT LEN(@sql);
+        PRINT @sql;
+    END;
+
+    INSERT
+        #regression_changes WITH(TABLOCK)
+    (
+        database_id,
+        plan_id,
+        query_hash,
+        change_since_regression_time_period
+    )
+    EXEC sys.sp_executesql
+        @sql,
+        @parameters,
+        @top,
+        @start_date,
+        @end_date,
+        @execution_count,
+        @duration_ms,
+        @execution_type_desc,
+        @database_id,
+        @queries_top,
+        @work_start_utc,
+        @work_end_utc,
+        @regression_baseline_start_date,
+        @regression_baseline_end_date;
+
+    IF @troubleshoot_performance = 1
+    BEGIN
+        SET STATISTICS XML OFF;
+    
+        EXEC sys.sp_executesql
+            @troubleshoot_update,
+          N'@current_table nvarchar(100)',
+            @current_table;
+    
+        EXEC sys.sp_executesql
+            @troubleshoot_info,
+          N'@sql nvarchar(max),
+            @current_table nvarchar(100)',
+            @sql,
+            @current_table;
+    END;
+
+END;
 
 /*
 This gets the plan_ids we care about.
@@ -4871,8 +5790,17 @@ BEGIN
 
     SET STATISTICS XML ON;
 END;
-
-IF @sort_order = 'plan count by hashes'
+IF @regression_mode = 1
+BEGIN
+    SELECT
+        @sql += N'
+    SELECT DISTINCT
+        plan_id
+    FROM #regression_changes
+    WHERE database_id = @database_id
+    OPTION(RECOMPILE);' + @nc10;
+END
+ELSE IF @sort_order = 'plan count by hashes'
 BEGIN
     SELECT
         @sql += N'
@@ -4945,7 +5873,9 @@ EXEC sys.sp_executesql
     @database_id,
     @queries_top,
     @work_start_utc,
-    @work_end_utc;
+    @work_end_utc,
+    @regression_baseline_start_date,
+    @regression_baseline_end_date;
 
 IF @troubleshoot_performance = 1
 BEGIN
@@ -4965,7 +5895,8 @@ BEGIN
 END; /*End gathering plan ids*/
 
 /*
-This gets the runtime stats for the plans we care about
+This gets the runtime stats for the plans we care about.
+It is notably the last usage of @where_clause.
 */
 SELECT
     @current_table = 'inserting #query_store_runtime_stats',
@@ -5064,6 +5995,29 @@ IF @new = 0
     NULL,';
     END;
 
+/*
+In regression mode, we do not mind seeing the
+same plan_id twice. We need the below to make
+the two time periods under consideration
+distinct.
+*/
+IF @regression_mode = 1
+BEGIN
+   SELECT
+       @sql +=  N'   
+   CASE
+       WHEN qsrs.last_execution_time >= @start_date AND qsrs.last_execution_time < @end_date
+       THEN ''No''
+       ELSE ''Yes''
+   END,';
+END
+ELSE
+BEGIN
+   SELECT
+       @sql +=  N'   
+   NULL,';
+END;
+
 SELECT
     @sql += N'
     context_settings = NULL
@@ -5073,46 +6027,94 @@ CROSS APPLY
     SELECT TOP (@queries_top)
         qsrs.*
     FROM ' + @database_name_quoted + N'.sys.query_store_runtime_stats AS qsrs'
-    IF @sort_order = 'plan count by hashes'
+    IF @regression_mode = 1
+    BEGIN
+        SELECT
+            @sql += N'
+            JOIN #regression_changes AS regression
+            ON qsrs.plan_id = regression.plan_id
+            AND regression.database_id = @database_id'    
+    END
+    ELSE IF @sort_order = 'plan count by hashes'
     BEGIN
         SELECT
             @sql += N'
             JOIN #plan_ids_with_query_hashes AS hashes
             ON qsrs.plan_id = hashes.plan_id
             AND hashes.database_id = @database_id'
-    END;
-    IF @sort_order_is_a_wait = 1
+    END
+    ELSE IF @sort_order_is_a_wait = 1
     BEGIN
         SELECT
             @sql += N'
             JOIN #plan_ids_with_total_waits AS waits
             ON qsrs.plan_id = waits.plan_id
             AND waits.database_id = @database_id'
-    END;    
+    END;
 
 SELECT
     @sql += N'
     WHERE qsrs.plan_id = dp.plan_id
     AND   1 = 1
-    ' + @where_clause
+    '
+    + CASE WHEN @regression_mode = 1
+      THEN N' AND ( 1 = 1
+      ' + @regression_where_clause
+      + N' )
+OR
+      ( 1 = 1
+      '
+      + @where_clause
+      + N' ) '
+      ELSE @where_clause
+      END
   + N'
     ORDER BY ' +
-CASE @sort_order
-     WHEN 'cpu' THEN N'qsrs.avg_cpu_time'
-     WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads'
-     WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads'
-     WHEN 'writes' THEN N'qsrs.avg_logical_io_writes'
-     WHEN 'duration' THEN N'qsrs.avg_duration'
-     WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory'
-     WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used' ELSE N'qsrs.avg_cpu_time' END
-     WHEN 'executions' THEN N'qsrs.count_executions'
-     WHEN 'recent' THEN N'qsrs.last_execution_time'
-     WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-     ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+CASE @regression_mode
+WHEN 1 THEN
+    /* As seen when populating #regression_changes. */
+    CASE @regression_direction
+       WHEN 'regressed' THEN N'regression.change_since_regression_time_period * -1'
+       WHEN 'worse' THEN N'regression.change_since_regression_time_period * -1'
+       WHEN 'improved' THEN N'regression.change_since_regression_time_period'
+       WHEN 'better' THEN N'regression.change_since_regression_time_period'
+       WHEN 'magnitude' THEN N'ABS(regression.change_since_regression_time_period)'
+       WHEN 'absolute' THEN N'ABS(regression.change_since_regression_time_period)'
+    END
+    ELSE
+    CASE @sort_order
+         WHEN 'cpu' THEN N'qsrs.avg_cpu_time'
+         WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads'
+         WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads'
+         WHEN 'writes' THEN N'qsrs.avg_logical_io_writes'
+         WHEN 'duration' THEN N'qsrs.avg_duration'
+         WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory'
+         WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used' ELSE N'qsrs.avg_cpu_time' END
+         WHEN 'executions' THEN N'qsrs.count_executions'
+         WHEN 'recent' THEN N'qsrs.last_execution_time'
+         WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
+         ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+    END
 END + N' DESC
 ) AS qsrs
 GROUP BY
-    qsrs.plan_id
+    qsrs.plan_id ' +
+/*
+In regression mode, we do not mind seeing the
+same plan_id twice. We need the below to make
+the two time periods under consideration
+distinct.
+*/
+CASE @regression_mode
+   WHEN 1 THEN  N' ,
+   CASE
+       WHEN qsrs.last_execution_time >= @start_date AND qsrs.last_execution_time < @end_date
+       THEN ''No''
+       ELSE ''Yes''
+   END'
+   ELSE N' '
+END
++ N'
 OPTION(RECOMPILE, OPTIMIZE FOR (@queries_top = 9223372036854775807));' + @nc10;
 
 IF @debug = 1
@@ -5138,6 +6140,7 @@ INSERT
     avg_num_physical_io_reads_mb, last_num_physical_io_reads_mb, min_num_physical_io_reads_mb, max_num_physical_io_reads_mb,
     avg_log_bytes_used_mb, last_log_bytes_used_mb, min_log_bytes_used_mb, max_log_bytes_used_mb,
     avg_tempdb_space_used_mb, last_tempdb_space_used_mb, min_tempdb_space_used_mb, max_tempdb_space_used_mb,
+    from_regression_baseline,
     context_settings
 )
 EXEC sys.sp_executesql
@@ -5152,7 +6155,9 @@ EXEC sys.sp_executesql
     @database_id,
     @queries_top,
     @work_start_utc,
-    @work_end_utc;
+    @work_end_utc,
+    @regression_baseline_start_date,
+    @regression_baseline_end_date;
 
 IF @troubleshoot_performance = 1
 BEGIN
@@ -6522,6 +7527,10 @@ primary key violations
 IF @get_all_databases = 1
 BEGIN
     TRUNCATE TABLE
+        #regression_baseline_runtime_stats;
+    TRUNCATE TABLE
+        #regression_current_runtime_stats;
+    TRUNCATE TABLE
         #distinct_plans;
     TRUNCATE TABLE
         #procedure_plans;
@@ -6529,6 +7538,8 @@ BEGIN
         #maintenance_plans;
     TRUNCATE TABLE
         #query_text_search;
+    TRUNCATE TABLE
+        #query_text_search_not;
     TRUNCATE TABLE
         #dm_exec_query_stats;
     TRUNCATE TABLE
@@ -6624,9 +7635,9 @@ FROM
         qsqt.query_sql_text,
         query_plan =
              CASE
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NOT NULL
-                 THEN TRY_CAST(qsp.query_plan AS XML)
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NULL
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NOT NULL
+                 THEN TRY_CAST(qsp.query_plan AS xml)
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NULL
                  THEN
                      (
                          SELECT
@@ -6681,11 +7692,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.first_execution_time
+                        qsrs.first_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.first_execution_time AT TIME ZONE @timezone
@@ -6696,11 +7706,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.last_execution_time
+                        qsrs.last_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.last_execution_time AT TIME ZONE @timezone
@@ -6784,21 +7793,34 @@ FROM
             ROW_NUMBER() OVER
             (
                 PARTITION BY
-                    qsrs.plan_id
+                  qsrs.plan_id
                 ORDER BY
-                    ' +
-        CASE @sort_order
-            WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
-            WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
-            WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
-            WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
-            WHEN 'duration' THEN N'qsrs.avg_duration_ms'
-            WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
-            WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
-            WHEN 'executions' THEN N'qsrs.count_executions'
-            WHEN 'recent' THEN N'qsrs.last_execution_time'
-            WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-            ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+                    '
+        +
+         CASE WHEN @regression_mode = 1 THEN
+             CASE @regression_direction
+                  WHEN 'regressed' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'worse' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'improved' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'better' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'magnitude' THEN N'ABS(regression.change_since_regression_time_period)'
+                  WHEN 'absolute' THEN N'ABS(regression.change_since_regression_time_period)'
+             END
+        ELSE
+            CASE @sort_order
+                 WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
+                 WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
+                 WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
+                 WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
+                 WHEN 'duration' THEN N'qsrs.avg_duration_ms'
+                 WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
+                 WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
+                 WHEN 'executions' THEN N'qsrs.count_executions'
+                 WHEN 'recent' THEN N'qsrs.last_execution_time'
+                 WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
+                 ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms'
+                 ELSE N'qsrs.avg_cpu_time' END
+            END
         END + N' DESC
             )'
         /*
@@ -6811,9 +7833,14 @@ FROM
            I find it's helpful.
         */
         + CASE WHEN @sort_order = 'plan count by hashes'
-               THEN N' , hashes.plan_hash_count_for_query_hash, hashes.query_hash'
+               THEN N' , hashes.plan_hash_count_for_query_hash,
+                         hashes.query_hash AS query_hash_from_hash_counting'
                WHEN @sort_order_is_a_wait = 1
                THEN N' , waits.total_query_wait_time_ms AS total_wait_time_from_sort_order_ms'
+               WHEN @regression_mode = 1
+               THEN N' , regression.change_since_regression_time_period,
+                         regression.query_hash AS query_hash_from_regression_checking,
+                         qsrs.from_regression_baseline AS row_is_from_regression_baseline_time_period'
                ELSE N''
                END
             )
@@ -6865,9 +7892,9 @@ FROM
         qsqt.query_sql_text,
         query_plan =
              CASE
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NOT NULL
-                 THEN TRY_CAST(qsp.query_plan AS XML)
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NULL
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NOT NULL
+                 THEN TRY_CAST(qsp.query_plan AS xml)
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NULL
                  THEN
                      (
                          SELECT
@@ -6925,11 +7952,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.first_execution_time
+                        qsrs.first_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.first_execution_time AT TIME ZONE @timezone
@@ -6940,11 +7966,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.last_execution_time
+                        qsrs.last_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.last_execution_time AT TIME ZONE @timezone
@@ -7031,19 +8056,32 @@ FROM
                 PARTITION BY
                     qsrs.plan_id
                 ORDER BY
-                    ' +
-        CASE @sort_order
-            WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
-            WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
-            WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
-            WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
-            WHEN 'duration' THEN N'qsrs.avg_duration_ms'
-            WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
-            WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
-            WHEN 'executions' THEN N'qsrs.count_executions'
-            WHEN 'recent' THEN N'qsrs.last_execution_time'
-            WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-            ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+                    '
+        +
+         CASE WHEN @regression_mode = 1 THEN
+             CASE @regression_direction
+                  WHEN 'regressed' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'worse' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'improved' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'better' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'magnitude' THEN N'ABS(regression.change_since_regression_time_period)'
+                  WHEN 'absolute' THEN N'ABS(regression.change_since_regression_time_period)'
+             END
+        ELSE
+            CASE @sort_order
+                 WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
+                 WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
+                 WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
+                 WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
+                 WHEN 'duration' THEN N'qsrs.avg_duration_ms'
+                 WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
+                 WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
+                 WHEN 'executions' THEN N'qsrs.count_executions'
+                 WHEN 'recent' THEN N'qsrs.last_execution_time'
+                 WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
+                 ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms'
+                 ELSE N'qsrs.avg_cpu_time' END
+            END
         END + N' DESC
             )'
         /*
@@ -7057,9 +8095,14 @@ FROM
            when applicable.
         */
         + CASE WHEN @sort_order = 'plan count by hashes'
-               THEN N' , FORMAT(hashes.plan_hash_count_for_query_hash, ''N0'') AS plan_hash_count_for_query_hash, hashes.query_hash'
+               THEN N' , FORMAT(hashes.plan_hash_count_for_query_hash, ''N0'') AS plan_hash_count_for_query_hash,
+                         hashes.query_hash AS query_hash_from_hash_counting'
                WHEN @sort_order_is_a_wait = 1
                THEN N' , FORMAT(waits.total_query_wait_time_ms, ''N0'') AS total_wait_time_from_sort_order_ms'
+               WHEN @regression_mode = 1
+               THEN N' , FORMAT(regression.change_since_regression_time_period, ''N0'') AS change_since_regression_time_period,
+                         regression.query_hash AS query_hash_from_regression_checking,
+                         qsrs.from_regression_baseline AS row_is_from_regression_baseline_time_period'
                ELSE N''
                END
             )
@@ -7111,9 +8154,9 @@ FROM
         qsqt.query_sql_text,
         query_plan =
              CASE
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NOT NULL
-                 THEN TRY_CAST(qsp.query_plan AS XML)
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NULL
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NOT NULL
+                 THEN TRY_CAST(qsp.query_plan AS xml)
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NULL
                  THEN
                      (
                          SELECT
@@ -7168,11 +8211,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.first_execution_time
+                        qsrs.first_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.first_execution_time AT TIME ZONE @timezone
@@ -7183,11 +8225,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.last_execution_time
+                        qsrs.last_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.last_execution_time AT TIME ZONE @timezone
@@ -7252,18 +8293,30 @@ FROM
                 ORDER BY
                     '
         +
-        CASE @sort_order
-            WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
-            WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
-            WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
-            WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
-            WHEN 'duration' THEN N'qsrs.avg_duration_ms'
-            WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
-            WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
-            WHEN 'executions' THEN N'qsrs.count_executions'
-            WHEN 'recent' THEN N'qsrs.last_execution_time'
-            WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-            ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+         CASE WHEN @regression_mode = 1 THEN
+             CASE @regression_direction
+                  WHEN 'regressed' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'worse' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'improved' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'better' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'magnitude' THEN N'ABS(regression.change_since_regression_time_period)'
+                  WHEN 'absolute' THEN N'ABS(regression.change_since_regression_time_period)'
+             END
+        ELSE
+            CASE @sort_order
+                 WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
+                 WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
+                 WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
+                 WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
+                 WHEN 'duration' THEN N'qsrs.avg_duration_ms'
+                 WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
+                 WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
+                 WHEN 'executions' THEN N'qsrs.count_executions'
+                 WHEN 'recent' THEN N'qsrs.last_execution_time'
+                 WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
+                 ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms'
+                 ELSE N'qsrs.avg_cpu_time' END
+            END
         END + N' DESC
             )'
         /*
@@ -7276,9 +8329,14 @@ FROM
            I find it's helpful.
         */
         + CASE WHEN @sort_order = 'plan count by hashes'
-               THEN N' , hashes.plan_hash_count_for_query_hash, hashes.query_hash'
+               THEN N' , hashes.plan_hash_count_for_query_hash,
+                         hashes.query_hash AS query_hash_from_hash_counting'
                WHEN @sort_order_is_a_wait = 1
                THEN N' , waits.total_query_wait_time_ms AS total_wait_time_from_sort_order_ms'
+               WHEN @regression_mode = 1
+               THEN N' , regression.change_since_regression_time_period,
+                         regression.query_hash AS query_hash_from_regression_checking,
+                         qsrs.from_regression_baseline AS row_is_from_regression_baseline_time_period'
                ELSE N''
                END
             )
@@ -7331,9 +8389,9 @@ FROM
         qsqt.query_sql_text,
         query_plan =
              CASE
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NOT NULL
-                 THEN TRY_CAST(qsp.query_plan AS XML)
-                 WHEN TRY_CAST(qsp.query_plan AS XML) IS NULL
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NOT NULL
+                 THEN TRY_CAST(qsp.query_plan AS xml)
+                 WHEN TRY_CAST(qsp.query_plan AS xml) IS NULL
                  THEN
                      (
                          SELECT
@@ -7388,11 +8446,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.first_execution_time
+                        qsrs.first_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.first_execution_time AT TIME ZONE @timezone
@@ -7403,11 +8460,10 @@ FROM
             CASE
                 WHEN @timezone IS NULL
                 THEN
-                    DATEADD
+                    SWITCHOFFSET
                     (
-                        MINUTE,
-                        @utc_minutes_original,
-                        qsrs.last_execution_time
+                        qsrs.last_execution_time,
+                        @utc_offset_string
                     )
                 WHEN @timezone IS NOT NULL
                 THEN qsrs.last_execution_time AT TIME ZONE @timezone
@@ -7472,18 +8528,30 @@ FROM
                 ORDER BY
                     '
         +
-        CASE @sort_order
-             WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
-             WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
-             WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
-             WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
-             WHEN 'duration' THEN N'qsrs.avg_duration_ms'
-             WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
-             WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
-             WHEN 'executions' THEN N'qsrs.count_executions'
-             WHEN 'recent' THEN N'qsrs.last_execution_time'
-             WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
-             ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms' ELSE N'qsrs.avg_cpu_time' END
+         CASE WHEN @regression_mode = 1 THEN
+             CASE @regression_direction
+                  WHEN 'regressed' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'worse' THEN N'regression.change_since_regression_time_period * -1'
+                  WHEN 'improved' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'better' THEN N'regression.change_since_regression_time_period'
+                  WHEN 'magnitude' THEN N'ABS(regression.change_since_regression_time_period)'
+                  WHEN 'absolute' THEN N'ABS(regression.change_since_regression_time_period)'
+             END
+        ELSE
+            CASE @sort_order
+                 WHEN 'cpu' THEN N'qsrs.avg_cpu_time_ms'
+                 WHEN 'logical reads' THEN N'qsrs.avg_logical_io_reads_mb'
+                 WHEN 'physical reads' THEN N'qsrs.avg_physical_io_reads_mb'
+                 WHEN 'writes' THEN N'qsrs.avg_logical_io_writes_mb'
+                 WHEN 'duration' THEN N'qsrs.avg_duration_ms'
+                 WHEN 'memory' THEN N'qsrs.avg_query_max_used_memory_mb'
+                 WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'qsrs.avg_tempdb_space_used_mb' ELSE N'qsrs.avg_cpu_time' END
+                 WHEN 'executions' THEN N'qsrs.count_executions'
+                 WHEN 'recent' THEN N'qsrs.last_execution_time'
+                 WHEN 'plan count by hashes' THEN N'hashes.plan_hash_count_for_query_hash DESC, hashes.query_hash'
+                 ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'waits.total_query_wait_time_ms'
+                 ELSE N'qsrs.avg_cpu_time' END
+            END
         END + N' DESC
             )'
         /*
@@ -7497,9 +8565,14 @@ FROM
            when applicable.
         */
         + CASE WHEN @sort_order = 'plan count by hashes'
-               THEN N' , FORMAT(hashes.plan_hash_count_for_query_hash, ''N0'') AS plan_hash_count_for_query_hash, hashes.query_hash'
+               THEN N' , FORMAT(hashes.plan_hash_count_for_query_hash, ''N0'') AS plan_hash_count_for_query_hash,
+                         hashes.query_hash AS query_hash_from_hash_counting'
                WHEN @sort_order_is_a_wait = 1
                THEN N' , FORMAT(waits.total_query_wait_time_ms, ''N0'') AS total_wait_time_from_sort_order_ms'
+               WHEN @regression_mode = 1
+               THEN N' , FORMAT(regression.change_since_regression_time_period, ''N0'') AS change_since_regression_time_period,
+                         regression.query_hash AS query_hash_from_regression_checking,
+                         qsrs.from_regression_baseline AS row_is_from_regression_baseline_time_period'
                ELSE N''
                END
             )
@@ -7517,7 +8590,15 @@ FROM
         N'
         FROM #query_store_runtime_stats AS qsrs'
     )
-    IF @sort_order = 'plan count by hashes'
+    IF @regression_mode = 1
+    BEGIN
+        SELECT
+            @sql += N'
+            JOIN #regression_changes AS regression
+            ON qsrs.plan_id = regression.plan_id
+            AND qsrs.database_id = regression.database_id'    
+    END
+    ELSE IF @sort_order = 'plan count by hashes'
     BEGIN
         SELECT
             @sql += N'
@@ -7702,11 +8783,14 @@ SELECT
         nvarchar(MAX),
         N'
 ) AS x
-WHERE x.n = 1
-ORDER BY ' +
+' + CASE WHEN @regression_mode = 1 THEN N' ' ELSE N' WHERE x.n = 1 ' END
++ N' ORDER BY ' +
     CASE @format_output
          WHEN 0
          THEN
+             CASE WHEN @regression_mode = 1 THEN 'x.change_since_regression_time_period DESC,
+                                                  x.query_hash_from_regression_checking'
+             ELSE
              CASE @sort_order
                   WHEN 'cpu' THEN N'x.avg_cpu_time_ms'
                   WHEN 'logical reads' THEN N'x.avg_logical_io_reads_mb'
@@ -7717,15 +8801,18 @@ ORDER BY ' +
                   WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'x.avg_tempdb_space_used_mb' ELSE N'x.avg_cpu_time' END
                   WHEN 'executions' THEN N'x.count_executions'
                   WHEN 'recent' THEN N'x.last_execution_time'
-                  WHEN 'plan count by hashes' THEN N'x.plan_hash_count_for_query_hash DESC, x.query_hash'
+                  WHEN 'plan count by hashes' THEN N'x.plan_hash_count_for_query_hash DESC, x.query_hash_from_hash_counting'
                   ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'x.total_wait_time_from_sort_order_ms' ELSE N'x.avg_cpu_time' END
-             END
+             END END
          /*
              The ORDER BY is on the same level as the topmost SELECT, which is just SELECT x.*.
              This means that to sort formatted output, we have to un-format it.
          */
          WHEN 1
          THEN
+             CASE WHEN @regression_mode = 1 THEN 'TRY_PARSE(x.change_since_regression_time_period AS money) DESC,
+                                                  x.query_hash_from_regression_checking'
+             ELSE
              CASE @sort_order
                   WHEN 'cpu' THEN N'TRY_PARSE(x.avg_cpu_time_ms AS money)'
                   WHEN 'logical reads' THEN N'TRY_PARSE(x.avg_logical_io_reads_mb AS money)'
@@ -7736,9 +8823,9 @@ ORDER BY ' +
                   WHEN 'tempdb' THEN CASE WHEN @new = 1 THEN N'TRY_PARSE(x.avg_tempdb_space_used_mb AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time AS money)' END
                   WHEN 'executions' THEN N'TRY_PARSE(x.count_executions AS money)'
                   WHEN 'recent' THEN N'x.last_execution_time'
-                  WHEN 'plan count by hashes' THEN N'TRY_PARSE(x.plan_hash_count_for_query_hash AS money) DESC, x.query_hash'
+                  WHEN 'plan count by hashes' THEN N'TRY_PARSE(x.plan_hash_count_for_query_hash AS money) DESC, x.query_hash_from_hash_counting'
                   ELSE CASE WHEN @sort_order_is_a_wait = 1 THEN N'TRY_PARSE(x.total_wait_time_from_sort_order_ms AS money)' ELSE N'TRY_PARSE(x.avg_cpu_time AS money)' END
-             END
+             END END
     END
              + N' DESC
 OPTION(RECOMPILE);'
@@ -7755,9 +8842,9 @@ OPTION(RECOMPILE);'
 
     EXEC sys.sp_executesql
         @sql,
-      N'@utc_minutes_original bigint,
+      N'@utc_offset_string nvarchar(6),
         @timezone sysname',
-        @utc_minutes_original,
+        @utc_offset_string,
         @timezone;
 END; /*End runtime stats main query*/
 ELSE
@@ -7810,11 +8897,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qspf.create_time
+                                   qspf.create_time,
+                                   @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qspf.create_time AT TIME ZONE @timezone
@@ -7825,11 +8911,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qspf.last_updated_time
+                                   qspf.last_updated_time,
+                                   @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qspf.last_updated_time AT TIME ZONE @timezone
@@ -7938,11 +9023,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qsq.initial_compile_start_time
+                                    qsq.initial_compile_start_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qsq.initial_compile_start_time AT TIME ZONE @timezone
@@ -7953,11 +9037,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qsq.last_compile_start_time
+                                    qsq.last_compile_start_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qsq.last_compile_start_time AT TIME ZONE @timezone
@@ -7968,11 +9051,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qsq.last_execution_time
+                                    qsq.last_execution_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qsq.last_execution_time AT TIME ZONE @timezone
@@ -8401,11 +9483,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qspf.create_time
+                                    qspf.create_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qspf.create_time AT TIME ZONE @timezone
@@ -8416,11 +9497,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qspf.last_updated_time
+                                    qspf.last_updated_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qspf.last_updated_time AT TIME ZONE @timezone
@@ -8529,11 +9609,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qsq.initial_compile_start_time
+                                    qsq.initial_compile_start_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qsq.initial_compile_start_time AT TIME ZONE @timezone
@@ -8544,11 +9623,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qsq.last_compile_start_time
+                                    qsq.last_compile_start_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qsq.last_compile_start_time AT TIME ZONE @timezone
@@ -8559,11 +9637,10 @@ BEGIN
                         CASE
                             WHEN @timezone IS NULL
                             THEN
-                                DATEADD
+                                SWITCHOFFSET
                                 (
-                                    MINUTE,
-                                    @utc_minutes_original,
-                                    qsq.last_execution_time
+                                    qsq.last_execution_time,
+                                    @utc_offset_string
                                 )
                             WHEN @timezone IS NOT NULL
                             THEN qsq.last_execution_time AT TIME ZONE @timezone
@@ -9159,8 +10236,6 @@ BEGIN
             @database_name,
         sort_order =
             @sort_order,
-        sort_order_is_a_wait =
-            @sort_order_is_a_wait,
         [top] =
             @top,
         start_date =
@@ -9235,6 +10310,14 @@ BEGIN
             @work_start,
         work_end =
             @work_end,
+        regression_baseline_start_date =
+            @regression_baseline_start_date,
+        regression_baseline_end_date =
+            @regression_baseline_end_date,
+        regression_comparator =
+            @regression_comparator,
+        regression_direction =
+            @regression_direction,
         help =
             @help,
         debug =
@@ -9281,6 +10364,8 @@ BEGIN
             @nc10,
         where_clause =
             @where_clause,
+        regression_where_clause =
+            @regression_where_clause,
         procedure_exists =
             @procedure_exists,
         query_store_exists =
@@ -9289,6 +10374,8 @@ BEGIN
             @query_store_trouble,
         query_store_waits_enabled =
             @query_store_waits_enabled,
+        sort_order_is_a_wait =
+            @sort_order_is_a_wait,
         sql_2022_views =
             @sql_2022_views,
         ags_present =
@@ -9315,18 +10402,24 @@ BEGIN
            @start_date_original,
        end_date_original =
            @end_date_original,
+       regression_baseline_start_date_original =
+           @regression_baseline_start_date_original,
+       regression_baseline_end_date_original =
+           @regression_baseline_end_date_original,
+       regression_mode =
+           @regression_mode,
        timezone =
            @timezone,
        utc_minutes_difference =
            @utc_minutes_difference,
-       utc_minutes_original =
-           @utc_minutes_original,
-        df =
-            @df,
-        work_start_utc =
-            @work_start_utc,
-        work_end_utc =
-            @work_end_utc;
+       utc_offset_string =
+           @utc_offset_string,
+       df =
+           @df,
+       work_start_utc =
+           @work_start_utc,
+       work_end_utc =
+           @work_end_utc;
 
     IF EXISTS
        (
@@ -9533,6 +10626,98 @@ BEGIN
         SELECT
             result =
                 '#plan_ids_with_total_waits is empty';
+    END;
+
+    IF EXISTS
+       (
+           SELECT
+               1/0
+           FROM #regression_baseline_plan_ids_with_total_waits AS waits_baseline
+       )
+    BEGIN
+        SELECT
+            table_name =
+                '#regression_baseline_plan_ids_with_total_waits',
+            waits_baseline.*
+        FROM #regression_baseline_plan_ids_with_total_waits AS waits_baseline
+        ORDER BY
+            waits_baseline.plan_id
+        OPTION(RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            result =
+                '#regression_baseline_plan_ids_with_total_waits is empty';
+    END;
+
+    IF EXISTS
+       (
+           SELECT
+               1/0
+           FROM #regression_baseline_runtime_stats AS runtime_stats_baseline
+       )
+    BEGIN
+        SELECT
+            table_name =
+                '#regression_baseline_runtime_stats',
+            runtime_stats_baseline.*
+        FROM #regression_baseline_runtime_stats AS runtime_stats_baseline
+        ORDER BY
+           runtime_stats_baseline.query_hash
+        OPTION(RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            result =
+                '#regression_baseline_runtime_stats is empty';
+    END;
+
+    IF EXISTS
+       (
+           SELECT
+               1/0
+           FROM #regression_current_runtime_stats AS runtime_stats_current
+       )
+    BEGIN
+        SELECT
+            table_name =
+                '#regression_current_runtime_stats',
+            runtime_stats_current.*
+        FROM #regression_current_runtime_stats AS runtime_stats_current
+        ORDER BY
+           runtime_stats_current.query_hash
+        OPTION(RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            result =
+                '#regression_current_runtime_stats is empty';
+    END;
+
+    IF EXISTS
+       (
+           SELECT
+               1/0
+           FROM #regression_changes AS changes
+       )
+    BEGIN
+        SELECT
+            table_name =
+                '#regression_changes',
+            changes.*
+        FROM #regression_changes AS changes
+        ORDER BY
+           changes.plan_id
+        OPTION(RECOMPILE);
+    END;
+    ELSE
+    BEGIN
+        SELECT
+            result =
+                '#regression_changes is empty';
     END;
 
     IF EXISTS
